@@ -1,30 +1,30 @@
 # Machine specification (Q1). Fill in every field; give units. Fill in N/A if not applicable.
 
-CPU model                       :
-Microarchitecture               :
-Physical cores                  :
-Logical cores (hardware threads):
-Performance / efficiency cores  :
-Base clock (GHz)                :
-Max single-core clock (GHz)     :
-All-core clock under load (GHz) :
-SIMD instruction set and width  :
-FMA units per core              :
-Vector registers per core       :
-L1 data cache (per core)        :
-L2 cache (size, shared by)      :
-L3 cache (size, shared by)      :
-Cache line size (bytes)         :
-RAM size (GB)                   :
-RAM type, speed (MT/s), channels:
-Operating system                :
-Compiler and version            :
+CPU model                       : AMD Ryzen 5 3550H
+Microarchitecture               : Zen+ (Picasso)
+Physical cores                  : 4
+Logical cores (hardware threads): 8
+Performance / efficiency cores  : N/A
+Base clock (GHz)                : 2.10 GHz
+Max single-core clock (GHz)     : 3.70 GHz
+All-core clock under load (GHz) : 3.1 GHz
+SIMD instruction set and width  : AVX2, 256-bit ISA (128-bit FPU pipes)
+FMA units per core              : 2 × 128-bit
+Vector registers per core       : 16 × 256-bit YMM
+L1 data cache (per core)        : 32 KB
+L2 cache (size, shared by)      : 512 KB per core (private)
+L3 cache (size, shared by)      : 4.0 MB (shared by 4 cores)
+Cache line size (bytes)         : 64
+RAM size (GB)                   : 13.9 GB (Usable), 16 GB (Installed)
+RAM type, speed (MT/s), channels: DDR4 SODIMM, 2400 MT/s, 2 channels
+Operating system                : Windows 11 host, programs run in WSL2 (Kali Linux)
+Compiler and version            : Debian clang version 21.1.8 (clang -O3 -march=native)
 
 # Derived (show the calculation in report.pdf)
-Peak FP32 GFLOP/s, one core     :
-Peak FP32 GFLOP/s, all cores    :
-Memory bandwidth (GB/s)         :
-Ridge point, one core (FLOP/B)  :
-Ridge point, all cores (FLOP/B) :
+Peak FP32 GFLOP/s, one core     : 59.2 GFLOP/s
+Peak FP32 GFLOP/s, all cores    : 198.4 GFLOP/s
+Memory bandwidth (GB/s)         : 38.4 GB/s
+Ridge point, one core (FLOP/B)  : 1.54 FLOP/B
+Ridge point, all cores (FLOP/B) : 5.17 FLOP/B
 
 

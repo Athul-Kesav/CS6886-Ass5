@@ -1,7 +1,7 @@
 /*
  * attn_fused.c -- Q3c: row-wise fusion (the N x N matrix is never stored).
  *
- * Placeholder: replace the body of attention() with your implementation.
+ * Q3c: row-block fusion: scores -> softmax -> PV per 16 rows; the NxN matrix is never stored.
  * Keep the driver (main) below unchanged. See attn_naive.c for the input and
  * output format.
  */
@@ -17,13 +17,138 @@
 #endif
 
 /* ------------------------------------------------------------------------- */
-/* attention(): write your implementation here.                               */
+/* attention(): the implementation.                                         */
 /* ------------------------------------------------------------------------- */
+#include <immintrin.h>
+
+#define NR 16 /* register tile: 4 rows x 16 columns (2 YMM per row, 8 accumulators) */
+
+static void *amalloc(size_t bytes)
+{
+    void *p;
+    if (posix_memalign(&p, 64, bytes)) {
+        fprintf(stderr, "out of memory\n");
+        exit(1);
+    }
+    return p;
+}
+
+static void check_dims(int N, int d)
+{
+    if (N % 32 || d % 16) {
+        fprintf(stderr, "this variant needs N %% 32 == 0 and d %% 16 == 0\n");
+        exit(1);
+    }
+}
+
+/* Pack K into panels of 16 keys: Kp[jb][k][c] = K[jb*16 + c][k]  (d x 16 each, contiguous). */
+static inline void pack_K_blk(const float *K, float *Kp, int jb, int d)
+{
+    for (int k = 0; k < d; k++)
+        for (int c = 0; c < NR; c++)
+            Kp[((size_t)jb * d + k) * NR + c] = K[((size_t)jb * NR + c) * d + k];
+}
+
+/* Pack V into panels of 16 columns: Vp[kb][j][c] = V[j][kb*16 + c]  (N x 16 each, contiguous). */
+static inline void pack_V_row(const float *V, float *Vp, int j, int N, int d)
+{
+    for (int kb = 0; kb < d / NR; kb++)
+        for (int c = 0; c < NR; c++)
+            Vp[((size_t)kb * N + j) * NR + c] = V[(size_t)j * d + kb * NR + c];
+}
+
+#define ROW(R, p, i)                                        \
+    a = _mm256_broadcast_ss((p) + (i));                     \
+    c##R##0 = _mm256_fmadd_ps(a, b0, c##R##0);              \
+    c##R##1 = _mm256_fmadd_ps(a, b1, c##R##1);
+
+#define ZERO_ACC                                            \
+    __m256 c00 = _mm256_setzero_ps(), c01 = c00, c10 = c00, c11 = c00, \
+           c20 = c00, c21 = c00, c30 = c00, c31 = c00, a, b0, b1;
+
+/* S[4 x 16] = scale * Q[4 x d] . Kpanel  (Kp is the packed d x 16 panel). */
+static inline void qk_kernel(const float *Q, const float *Kp, float *S, int d, int ldS, float scale)
+{
+    ZERO_ACC
+    const float *q0 = Q, *q1 = Q + d, *q2 = Q + 2 * (size_t)d, *q3 = Q + 3 * (size_t)d;
+    for (int k = 0; k < d; k++) {
+        b0 = _mm256_loadu_ps(Kp + (size_t)k * NR);
+        b1 = _mm256_loadu_ps(Kp + (size_t)k * NR + 8);
+        ROW(0, q0, k) ROW(1, q1, k) ROW(2, q2, k) ROW(3, q3, k)
+    }
+    __m256 sc = _mm256_set1_ps(scale);
+    float *s1 = S + ldS, *s2 = S + 2 * (size_t)ldS, *s3 = S + 3 * (size_t)ldS;
+    _mm256_storeu_ps(S, _mm256_mul_ps(c00, sc));  _mm256_storeu_ps(S + 8, _mm256_mul_ps(c01, sc));
+    _mm256_storeu_ps(s1, _mm256_mul_ps(c10, sc)); _mm256_storeu_ps(s1 + 8, _mm256_mul_ps(c11, sc));
+    _mm256_storeu_ps(s2, _mm256_mul_ps(c20, sc)); _mm256_storeu_ps(s2 + 8, _mm256_mul_ps(c21, sc));
+    _mm256_storeu_ps(s3, _mm256_mul_ps(c30, sc)); _mm256_storeu_ps(s3 + 8, _mm256_mul_ps(c31, sc));
+}
+
+/* O[4 x 16] = P[4 x N] . Vpanel  (Vp is the packed N x 16 panel). */
+static inline void pv_kernel(const float *P, int ldP, const float *Vp, float *O, int ldO, int N)
+{
+    ZERO_ACC
+    const float *p0 = P, *p1 = P + ldP, *p2 = P + 2 * (size_t)ldP, *p3 = P + 3 * (size_t)ldP;
+    for (int j = 0; j < N; j++) {
+        b0 = _mm256_loadu_ps(Vp + (size_t)j * NR);
+        b1 = _mm256_loadu_ps(Vp + (size_t)j * NR + 8);
+        ROW(0, p0, j) ROW(1, p1, j) ROW(2, p2, j) ROW(3, p3, j)
+    }
+    float *o1 = O + ldO, *o2 = O + 2 * (size_t)ldO, *o3 = O + 3 * (size_t)ldO;
+    _mm256_storeu_ps(O, c00);  _mm256_storeu_ps(O + 8, c01);
+    _mm256_storeu_ps(o1, c10); _mm256_storeu_ps(o1 + 8, c11);
+    _mm256_storeu_ps(o2, c20); _mm256_storeu_ps(o2 + 8, c21);
+    _mm256_storeu_ps(o3, c30); _mm256_storeu_ps(o3 + 8, c31);
+}
+
+/* Scalar softmax of one row, exactly as in the naive code. */
+static void softmax_row_scalar(float *row, int N)
+{
+    float max = row[0];
+    for (int j = 1; j < N; j++)
+        if (row[j] > max)
+            max = row[j];
+    float sum = 0.0f;
+    for (int j = 0; j < N; j++) {
+        row[j] = expf(row[j] - max);
+        sum += row[j];
+    }
+    for (int j = 0; j < N; j++)
+        row[j] = row[j] / sum;
+}
+
 void attention(const float *Q, const float *K, const float *V, float *O, int N, int d)
 {
-    (void)Q; (void)K; (void)V; (void)O; (void)N; (void)d;
-    printf("attn_fused: not implemented yet\n");
-    exit(0); /* no output file is written, so `make check` skips this variant */
+    check_dims(N, d);
+    const float scale = 1.0f / sqrtf((float)d);
+    enum { RB = 16 }; /* query rows processed together: the only score storage is RB x N */
+    float *buf = amalloc((size_t)RB * N * sizeof(float));
+    float *Kp = amalloc((size_t)N * d * sizeof(float));
+    float *Vp = amalloc((size_t)N * d * sizeof(float));
+    for (int jb = 0; jb < N / NR; jb++)
+        pack_K_blk(K, Kp, jb, d);
+    for (int j = 0; j < N; j++)
+        pack_V_row(V, Vp, j, N, d);
+
+    for (int ib = 0; ib < N; ib += RB) {
+        /* scores for RB rows: RB x N, lives in L2 instead of an N x N array in DRAM */
+        for (int jp = 0; jp < N / NR; jp++)
+            for (int g = 0; g < RB; g += 4)
+                qk_kernel(Q + (size_t)(ib + g) * d, Kp + (size_t)jp * d * NR,
+                          buf + (size_t)g * N + (size_t)jp * NR, d, N, scale);
+        /* softmax those rows while they are still cached */
+        for (int r = 0; r < RB; r++)
+            softmax_row_scalar(buf + (size_t)r * N, N);
+        /* O rows = probabilities x V */
+        for (int kb = 0; kb < d / NR; kb++)
+            for (int g = 0; g < RB; g += 4)
+                pv_kernel(buf + (size_t)g * N, N, Vp + (size_t)kb * N * NR,
+                          O + (size_t)(ib + g) * d + (size_t)kb * NR, d, N);
+    }
+
+    free(Vp);
+    free(Kp);
+    free(buf);
 }
 
 /* ------------------------------------------------------------------------- */
